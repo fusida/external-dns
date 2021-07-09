@@ -162,6 +162,8 @@ func (sc *ingressSource) Endpoints(ctx context.Context) ([]*endpoint.Endpoint, e
 		log.Debugf("Endpoints generated from ingress: %s/%s: %v", ing.Namespace, ing.Name, ingEndpoints)
 		sc.setResourceLabel(ing, ingEndpoints)
 		sc.setDualstackLabel(ing, ingEndpoints)
+		// add by star, 2021-7-8, for multi ingress point to one hostname(dnsname)
+		sc.setIdentifier(ing, ingEndpoints)
 		endpoints = append(endpoints, ingEndpoints...)
 	}
 
@@ -232,6 +234,13 @@ func (sc *ingressSource) filterByAnnotations(ingresses []*v1beta1.Ingress) ([]*v
 func (sc *ingressSource) setResourceLabel(ingress *v1beta1.Ingress, endpoints []*endpoint.Endpoint) {
 	for _, ep := range endpoints {
 		ep.Labels[endpoint.ResourceLabelKey] = fmt.Sprintf("ingress/%s/%s", ingress.Namespace, ingress.Name)
+	}
+}
+
+// add by star, 2021-7-8, support multi ingress point to one host
+func (sc *ingressSource) setIdentifier(ingress *v1beta1.Ingress, endpoints []*endpoint.Endpoint) {
+	for _, ep := range endpoints {
+		ep.SetIdentifier = fmt.Sprintf("ingress/%s/%s", ingress.Namespace, ingress.Name)
 	}
 }
 

@@ -62,6 +62,7 @@ type coreDNSProvider struct {
 	coreDNSPrefix string
 	domainFilter  endpoint.DomainFilter
 	client        coreDNSClient
+	ownerID       string //refers to the owner id of the current instance
 }
 
 // Service represents CoreDNS etcd record
@@ -246,7 +247,7 @@ func newETCDClient() (coreDNSClient, error) {
 }
 
 // NewCoreDNSProvider is a CoreDNS provider constructor
-func NewCoreDNSProvider(domainFilter endpoint.DomainFilter, prefix string, dryRun bool) (provider.Provider, error) {
+func NewCoreDNSProvider(domainFilter endpoint.DomainFilter, prefix string, dryRun bool, ownerID string) (provider.Provider, error) {
 	client, err := newETCDClient()
 	if err != nil {
 		return nil, err
@@ -257,14 +258,16 @@ func NewCoreDNSProvider(domainFilter endpoint.DomainFilter, prefix string, dryRu
 		dryRun:        dryRun,
 		coreDNSPrefix: prefix,
 		domainFilter:  domainFilter,
+		ownerID:       ownerID,
 	}, nil
 }
 
 // findEp takes an Endpoint slice and looks for an element in it. If found it will
 // return Endpoint, otherwise it will return nil and a bool of false.
-func findEp(slice []*endpoint.Endpoint, dnsName string) (*endpoint.Endpoint, bool) {
+func findEp(slice []*endpoint.Endpoint, dnsName, resource string) (*endpoint.Endpoint, bool) {
 	for _, item := range slice {
-		if item.DNSName == dnsName {
+		// change by star, 2021-7-9, add identifier
+		if item.DNSName == dnsName && item.SetIdentifier == resource {
 			return item, true
 		}
 	}
@@ -291,6 +294,18 @@ func (p coreDNSProvider) Records(ctx context.Context) ([]*endpoint.Endpoint, err
 		return nil, err
 	}
 	for _, service := range services {
+		// add by star, 2021-7-8
+		// determine whether the record ownered by this externalDNS , used ownerid = clustername
+		label, err := endpoint.NewLabelsFromString(service.Text)
+		if err != nil {
+			log.Debugf("Parser service(%s) Text fail, %v", service, err)
+			continue
+		}
+		if v, ok := label[endpoint.OwnerLabelKey]; !ok || p.ownerID != v {
+			continue
+		}
+		// end
+
 		domains := strings.Split(strings.TrimPrefix(service.Key, p.coreDNSPrefix), "/")
 		reverse(domains)
 		dnsName := strings.Join(domains[service.TargetStrip:], ".")
@@ -300,7 +315,7 @@ func (p coreDNSProvider) Records(ctx context.Context) ([]*endpoint.Endpoint, err
 		log.Debugf("Getting service (%v) with service host (%s)", service, service.Host)
 		prefix := strings.Join(domains[:service.TargetStrip], ".")
 		if service.Host != "" {
-			ep, found := findEp(result, dnsName)
+			ep, found := findEp(result, dnsName, label[endpoint.ResourceLabelKey])
 			if found {
 				ep.Targets = append(ep.Targets, service.Host)
 				log.Debugf("Extending ep (%s) with new service host (%s)", ep, service.Host)
@@ -316,6 +331,10 @@ func (p coreDNSProvider) Records(ctx context.Context) ([]*endpoint.Endpoint, err
 			ep.Labels["originalText"] = service.Text
 			ep.Labels[randomPrefixLabel] = prefix
 			ep.Labels[service.Host] = prefix
+			// add by star, 2021-7-9, deal multi ingress point to one host
+			if v, ok := label[endpoint.ResourceLabelKey]; ok {
+				ep.WithSetIdentifier(v)
+			}
 			result = append(result, ep)
 		}
 		if service.Text != "" {
@@ -325,6 +344,10 @@ func (p coreDNSProvider) Records(ctx context.Context) ([]*endpoint.Endpoint, err
 				service.Text,
 			)
 			ep.Labels[randomPrefixLabel] = prefix
+			// add by star, 2021-7-9, deal multi ingress point to one host
+			if v, ok := label[endpoint.ResourceLabelKey]; ok {
+				ep.WithSetIdentifier(v)
+			}
 			result = append(result, ep)
 		}
 	}
@@ -352,7 +375,15 @@ func (p coreDNSProvider) ApplyChanges(ctx context.Context, changes *plan.Changes
 			if ep.RecordType == endpoint.RecordTypeTXT {
 				continue
 			}
-
+			// add by star, 2021-7-9, change text info to right
+			// if update, the original will be add by coredns Records function
+			// if create, the label owner will be add txt Applychanges function and produce txt type records
+			// it need to move here to support multi ingress point to one hosts and support one host relate with multi backend ingress ip
+			text := ep.Labels["originalText"]
+			if text == "" {
+				ep.Labels[endpoint.OwnerLabelKey] = p.ownerID
+				text = ep.Labels.Serialize(true)
+			}
 			for _, target := range ep.Targets {
 				prefix := ep.Labels[target]
 				log.Debugf("Getting prefix(%s) from label(%s)", prefix, target)
@@ -362,8 +393,10 @@ func (p coreDNSProvider) ApplyChanges(ctx context.Context, changes *plan.Changes
 				}
 
 				service := Service{
-					Host:        target,
-					Text:        ep.Labels["originalText"],
+					Host: target,
+					// change by star, 2021-7-9
+					// Text:        ep.Labels["originalText"],
+					Text:        text,
 					Key:         p.etcdKeyFor(prefix + "." + dnsName),
 					TargetStrip: strings.Count(prefix, ".") + 1,
 					TTL:         uint32(ep.RecordTTL),
@@ -377,11 +410,12 @@ func (p coreDNSProvider) ApplyChanges(ctx context.Context, changes *plan.Changes
 			// Clean outdated targets
 			for label, labelPrefix := range ep.Labels {
 				// Skip non Target related labels
-				labelsToSkip := []string{"originalText", "prefix", "resource"}
+				labelsToSkip := []string{"originalText", "prefix", "resource", "owner"}
 				if _, ok := findLabelInTargets(labelsToSkip, label); ok {
 					continue
 				}
-
+				// delete old records by label, such as /skydns/org/example/my-nginx/2ae7c9d7
+				// the label may be 10.1.1.1 and the value be 2ae7c9d7
 				log.Debugf("Finding label (%s) in targets(%v)", label, ep.Targets)
 				if _, ok := findLabelInTargets(ep.Targets, label); !ok {
 					log.Debugf("Found non existing label(%s) in targets(%v)", label, ep.Targets)
@@ -412,15 +446,18 @@ func (p coreDNSProvider) ApplyChanges(ctx context.Context, changes *plan.Changes
 					Key:         p.etcdKeyFor(prefix + "." + dnsName),
 					TargetStrip: strings.Count(prefix, ".") + 1,
 					TTL:         uint32(ep.RecordTTL),
+					Text:        ep.Targets[0],
 				})
 			}
-			services[index].Text = ep.Targets[0]
+			// change by star, 2021-7-8, fix two targets ip will miss text
+			// services[index].Text = ep.Targets[0]
 			index++
 		}
 
-		for i := index; index > 0 && i < len(services); i++ {
-			services[i].Text = ""
-		}
+		// change by star, 2021-7-8, fix two targets ip will miss text
+		// for i := index; index > 0 && i < len(services); i++ {
+		// 	services[i].Text = ""
+		// }
 
 		for _, service := range services {
 			log.Infof("Add/set key %s to Host=%s, Text=%s, TTL=%d", service.Key, service.Host, service.Text, service.TTL)

@@ -157,7 +157,7 @@ func (p *Plan) Calculate() *Plan {
 			if row.current != nil && len(row.candidates) > 0 { //dns name is taken
 				update := t.resolver.ResolveUpdate(row.current, row.candidates)
 				// compare "update" to "current" to figure out if actual update is required
-				if shouldUpdateTTL(update, row.current) || targetChanged(update, row.current) || p.shouldUpdateProviderSpecific(update, row.current) {
+				if shouldUpdateLabelsResource(update, row.current) || shouldUpdateTTL(update, row.current) || targetChanged(update, row.current) || p.shouldUpdateProviderSpecific(update, row.current) {
 					inheritOwner(row.current, update)
 					changes.UpdateNew = append(changes.UpdateNew, update)
 					changes.UpdateOld = append(changes.UpdateOld, row.current)
@@ -192,6 +192,12 @@ func inheritOwner(from, to *endpoint.Endpoint) {
 
 func targetChanged(desired, current *endpoint.Endpoint) bool {
 	return !desired.Targets.Same(current.Targets)
+}
+
+// add by star, 2021-7-8
+// if resource label change need to update
+func shouldUpdateLabelsResource(desired, current *endpoint.Endpoint) bool {
+	return desired.Labels[endpoint.ResourceLabelKey] != current.Labels[endpoint.ResourceLabelKey]
 }
 
 func shouldUpdateTTL(desired, current *endpoint.Endpoint) bool {

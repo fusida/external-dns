@@ -259,7 +259,7 @@ func main() {
 			},
 		)
 	case "coredns", "skydns":
-		p, err = coredns.NewCoreDNSProvider(domainFilter, cfg.CoreDNSPrefix, cfg.DryRun)
+		p, err = coredns.NewCoreDNSProvider(domainFilter, cfg.CoreDNSPrefix, cfg.DryRun, cfg.TXTOwnerID)
 	case "rdns":
 		p, err = rdns.NewRDNSProvider(
 			rdns.RDNSConfig{
